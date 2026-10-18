@@ -10,7 +10,7 @@ env:
   KERNEL_SOURCE: https://github.com/LineageOS/android_kernel_oneplus_sm8250.git
   KERNEL_BRANCH: lineage-24.0
   KSU_BRANCH: builtin
-  KPM_PATCH_VERSION: 0.12.2
+  KPM_PATCH_VERSION: 0.13.9
 
 jobs:
   build:
@@ -69,18 +69,26 @@ jobs:
           grep -q 'kernelsu' drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig
 
-      - name: Apply non-GKI manual hooks
+      - name: Integrate SUSFS kernel-side patches for Linux 4.19
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
-          # This upstream 4.19/5.4 hook patch is attempted only after SukiSU is integrated.
-          # Fail early if it does not match this exact kernel tree; do not build a kernel
-          # that appears successful but has incomplete root hooks.
-          curl -fL --retry 3 \
-            https://raw.githubusercontent.com/rksuorg/kernel_patches/master/manual_hook/kernel-4.19_5.4.patch \
-            -o /tmp/manual-hook.patch
-          patch --batch --forward --dry-run -p1 < /tmp/manual-hook.patch
-          patch --batch --forward -p1 < /tmp/manual-hook.patch
+          # SukiSU's builtin integration exposes SUSFS options, but the build log showed
+          # that the kernel-side SUSFS implementation was still absent. Use the SUSFS
+          # patch set specifically intended for non-GKI Linux 4.19.
+          git clone --depth=1 --branch kernel-4.19 \
+            https://gitlab.com/simonpunk/susfs4ksu.git "$GITHUB_WORKSPACE/susfs4ksu"
+          SUSFS="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches"
+          test -s "$SUSFS/50_add_susfs_in_kernel-4.19.patch"
+          test -s "$SUSFS/fs/susfs.c"
+          test -s "$SUSFS/include/linux/susfs.h"
+          install -m 0644 "$SUSFS/fs/susfs.c" fs/susfs.c
+          install -m 0644 "$SUSFS/include/linux/susfs.h" include/linux/susfs.h
+          # Do not silently continue with a partially applied patch.
+          patch --batch --forward --dry-run -p1 < "$SUSFS/50_add_susfs_in_kernel-4.19.patch"
+          patch --batch --forward -p1 < "$SUSFS/50_add_susfs_in_kernel-4.19.patch"
+          grep -q 'susfs' fs/Makefile
+          grep -q 'susfs' include/linux/mount.h || grep -q 'susfs' include/linux/susfs.h
 
       - name: Configure kernel
         run: |
@@ -89,13 +97,33 @@ jobs:
           mkdir -p out
           if [ -f "$GITHUB_WORKSPACE/device_config" ]; then
             cp "$GITHUB_WORKSPACE/device_config" out/.config
+            echo 'Using repository-provided device_config'
           else
+            DEFCONFIG=''
+            for candidate in \
+              vendor/sm8250-perf_defconfig \
+              vendor/instantnoodlep_defconfig \
+              vendor/sm8250_defconfig \
+              instantnoodlep_defconfig; do
+              if [ -f "arch/arm64/configs/$candidate" ]; then
+                DEFCONFIG="$candidate"
+                break
+              fi
+            done
+            if [ -z "$DEFCONFIG" ]; then
+              echo 'ERROR: No known OnePlus 8 Pro/SM8250 defconfig was found.' >&2
+              find arch/arm64/configs -type f -name '*defconfig' | sort | grep -Ei 'sm8250|instantnoodlep|kona' || true
+              exit 1
+            fi
+            echo "Using defconfig: $DEFCONFIG"
             make O=out ARCH=arm64 \
               CROSS_COMPILE=aarch64-linux-android- \
               CROSS_COMPILE_ARM32=arm-linux-androideabi- \
               CLANG_TRIPLE=aarch64-linux-gnu- CC=clang \
-              vendor/sm8250-perf_defconfig
+              "$DEFCONFIG"
           fi
+          # Always normalize the config before setting options; this prevents the
+          # interactive Kconfig restart prompts shown in the supplied failed log.
           make O=out ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
@@ -115,6 +143,10 @@ jobs:
           scripts/config --file out/.config -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
           scripts/config --file out/.config -e KSU_SUSFS_OPEN_REDIRECT
           scripts/config --file out/.config -e KSU_SUSFS_SUS_MAP
+          # This old Android 4.19 tree's BPF UMD helper is not generated correctly
+          # (bpf_preload_umd_blob.S fails its .incbin). Keep core BPF enabled, but
+          # disable only the optional userspace preload helper that triggers the failure.
+          scripts/config --file out/.config -d BPF_PRELOAD_UMD
           make O=out ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
@@ -122,7 +154,16 @@ jobs:
           grep -E 'CONFIG_KSU=|CONFIG_KPM=|CONFIG_KSU_SUSFS' out/.config || true
           grep -q '^CONFIG_KSU=y' out/.config
           grep -q '^CONFIG_KPM=y' out/.config
+          grep -q '^CONFIG_KALLSYMS=y' out/.config
+          grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config
           grep -q '^CONFIG_KSU_SUSFS=y' out/.config
+          if grep -Eq '^CONFIG_BPF_PRELOAD_UMD=[ym]' out/.config; then
+            echo 'ERROR: optional BPF UMD preload helper is still enabled' >&2
+            exit 1
+          fi
+          # Confirm the kernel-side SUSFS source and Makefile integration exist.
+          test -s fs/susfs.c
+          grep -q 'susfs' fs/Makefile
 
       - name: Build kernel
         run: |
