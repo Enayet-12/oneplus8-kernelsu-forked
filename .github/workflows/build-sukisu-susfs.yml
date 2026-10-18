@@ -84,11 +84,42 @@ jobs:
           test -s "$SUSFS/include/linux/susfs.h"
           install -m 0644 "$SUSFS/fs/susfs.c" fs/susfs.c
           install -m 0644 "$SUSFS/include/linux/susfs.h" include/linux/susfs.h
-          # Do not silently continue with a partially applied patch.
-          patch --batch --forward --dry-run -p1 < "$SUSFS/50_add_susfs_in_kernel-4.19.patch"
-          patch --batch --forward -p1 < "$SUSFS/50_add_susfs_in_kernel-4.19.patch"
+          # Preserve exact source context and rejected hunks so incompatibilities can
+          # be adapted to this LineageOS branch instead of forcing a partial patch.
+          DIAG="$GITHUB_WORKSPACE/susfs-diagnostics"
+          mkdir -p "$DIAG/original" "$DIAG/after-patch"
+          cp "$SUSFS/50_add_susfs_in_kernel-4.19.patch" "$DIAG/"
+          for file in fs/namespace.c fs/proc/task_mmu.c include/linux/mount.h fs/Makefile; do
+            mkdir -p "$DIAG/original/$(dirname "$file")"
+            cp "$file" "$DIAG/original/$file"
+          done
+          set +e
+          patch --batch --forward --reject-file="$DIAG/failed-hunks.rej" -p1 \
+            < "$SUSFS/50_add_susfs_in_kernel-4.19.patch" > "$DIAG/patch-output.log" 2>&1
+          PATCH_STATUS=$?
+          set -e
+          for file in fs/namespace.c fs/proc/task_mmu.c include/linux/mount.h fs/Makefile; do
+            mkdir -p "$DIAG/after-patch/$(dirname "$file")"
+            cp "$file" "$DIAG/after-patch/$file"
+          done
+          git diff -- fs/namespace.c fs/proc/task_mmu.c include/linux/mount.h fs/Makefile \
+            > "$DIAG/partial-kernel-diff.patch" || true
+          cat "$DIAG/patch-output.log"
+          if [ "$PATCH_STATUS" -ne 0 ] || [ -s "$DIAG/failed-hunks.rej" ]; then
+            echo 'ERROR: SUSFS patch is not fully compatible. Diagnostic files will be uploaded; refusing to build a partially patched kernel.' >&2
+            exit 1
+          fi
           grep -q 'susfs' fs/Makefile
           grep -q 'susfs' include/linux/mount.h || grep -q 'susfs' include/linux/susfs.h
+
+      - name: Upload SUSFS patch diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs-patch-diagnostics-${{ github.run_number }}
+          path: ${{ github.workspace }}/susfs-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Configure kernel
         run: |
