@@ -73,9 +73,6 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
-          # SukiSU's builtin integration exposes SUSFS options, but the build log showed
-          # that the kernel-side SUSFS implementation was still absent. Use the SUSFS
-          # patch set specifically intended for non-GKI Linux 4.19.
           git clone --depth=1 --branch kernel-4.19 \
             https://gitlab.com/simonpunk/susfs4ksu.git "$GITHUB_WORKSPACE/susfs4ksu"
           SUSFS="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches"
@@ -84,8 +81,7 @@ jobs:
           test -s "$SUSFS/include/linux/susfs.h"
           install -m 0644 "$SUSFS/fs/susfs.c" fs/susfs.c
           install -m 0644 "$SUSFS/include/linux/susfs.h" include/linux/susfs.h
-          # Preserve exact source context and rejected hunks so incompatibilities can
-          # be adapted to this LineageOS branch instead of forcing a partial patch.
+
           DIAG="$GITHUB_WORKSPACE/susfs-diagnostics"
           mkdir -p "$DIAG/original" "$DIAG/after-patch"
           cp "$SUSFS/50_add_susfs_in_kernel-4.19.patch" "$DIAG/"
@@ -93,24 +89,208 @@ jobs:
             mkdir -p "$DIAG/original/$(dirname "$file")"
             cp "$file" "$DIAG/original/$file"
           done
+
+          # Apply the upstream patch's compatible hunks. This LineageOS branch has
+          # fs_context backports, so the rejected mount hunks are adapted below.
           set +e
           patch --batch --forward --reject-file="$DIAG/failed-hunks.rej" -p1 \
             < "$SUSFS/50_add_susfs_in_kernel-4.19.patch" > "$DIAG/patch-output.log" 2>&1
           PATCH_STATUS=$?
           set -e
+          cat "$DIAG/patch-output.log"
+          if [ "$PATCH_STATUS" -ne 0 ]; then
+            grep -q '4 out of 16 hunks FAILED' "$DIAG/patch-output.log"
+            grep -q '1 out of 3 hunks FAILED' "$DIAG/patch-output.log"
+            grep -q '1 out of 1 hunk FAILED' "$DIAG/patch-output.log"
+            FAIL_COUNT=$(grep -c 'Hunk #[0-9].*FAILED' "$DIAG/patch-output.log" || true)
+            if [ "$FAIL_COUNT" -ne 6 ]; then
+              echo "Unexpected SUSFS patch failure count: $FAIL_COUNT (expected 6)" >&2
+              exit 1
+            fi
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"Expected one match in {path}, found {count}: {old[:100]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          # The include hunk's context differs because this branch includes fs_context.h.
+          replace_once(
+              "fs/namespace.c",
+              "#include <linux/fs_context.h>\n",
+              "#include <linux/fs_context.h>\n"
+              "#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)\n"
+              "#include <linux/susfs_def.h>\n"
+              "#endif\n",
+          )
+          replace_once(
+              "fs/namespace.c",
+              '#include "internal.h"\n',
+              '''#include "internal.h"
+
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          extern bool susfs_is_current_ksu_domain(void);
+          extern bool susfs_is_current_zygote_domain(void);
+
+          static DEFINE_IDA(susfs_mnt_id_ida);
+          static DEFINE_IDA(susfs_mnt_group_ida);
+
+          #define CL_ZYGOTE_COPY_MNT_NS BIT(24) /* used by copy_mnt_ns() */
+          #define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
+          #endif
+
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+          extern void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname);
+          bool susfs_is_auto_add_sus_ksu_default_mount_enabled = true;
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+          extern int susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target);
+          bool susfs_is_auto_add_sus_bind_mount_enabled = true;
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+          extern void susfs_auto_add_try_umount_for_bind_mount(struct path *path);
+          bool susfs_is_auto_add_try_umount_for_bind_mount_enabled = true;
+          #endif
+          '''.replace("\n          ", "\n"),
+          )
+
+          replace_once(
+              "fs/namespace.c",
+              "\tmnt = alloc_vfsmnt(fc->source ?: \"none\");\n"
+              "\tif (!mnt)\n"
+              "\t\treturn ERR_PTR(-ENOMEM);",
+              '''#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \tif (unlikely(susfs_is_current_ksu_domain()))
+          \t\tmnt = alloc_vfsmnt(fc->source ?: "none", true, 0);
+          \telse
+          \t\tmnt = alloc_vfsmnt(fc->source ?: "none", false, 0);
+          #else
+          \tmnt = alloc_vfsmnt(fc->source ?: "none");
+          #endif
+          \tif (!mnt)
+          \t\treturn ERR_PTR(-ENOMEM);'''.replace("\n          ", "\n"),
+          )
+          replace_once(
+              "fs/namespace.c",
+              "\tmnt->mnt_parent\t\t= mnt;\n\n"
+              "\tlock_mount_hash();\n"
+              "\tlist_add_tail(&mnt->mnt_instance, &mnt->mnt.mnt_sb->s_mounts);",
+              '''\tmnt->mnt_parent\t\t= mnt;
+
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \t// For zygote-created mounts, reorder the visible mount ID.
+          \tif (susfs_is_current_zygote_domain()) {
+          \t\tmnt->mnt.susfs_mnt_id_backup = mnt->mnt_id;
+          \t\tmnt->mnt_id = current->susfs_last_fake_mnt_id++;
+          \t}
+          #endif
+
+          \tlock_mount_hash();
+          \tlist_add_tail(&mnt->mnt_instance, &mnt->mnt.mnt_sb->s_mounts);'''.replace("\n          ", "\n"),
+          )
+
+          replace_once(
+              "fs/namespace.c",
+              "\tstruct mount *mnt;\n\tint err;\n\n\tmnt = alloc_vfsmnt(old->mnt_devname);",
+              '''\tstruct mount *mnt;
+          \tint err;
+
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \tbool is_current_ksu_domain = susfs_is_current_ksu_domain();
+          \tbool is_current_zygote_domain = susfs_is_current_zygote_domain();
+          #endif
+
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \t/* Distinguish a single clone from a mount-namespace copy. */
+          \tif (unlikely(is_current_ksu_domain)) {
+          \t\tif (!(flag & CL_COPY_MNT_NS)) {
+          \t\t\tmnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          \t\t\tgoto bypass_orig_flow;
+          \t\t}
+          \t\tmnt = alloc_vfsmnt(old->mnt_devname, true, old->mnt_id);
+          \t\tif (mnt)
+          \t\t\tmnt->mnt.susfs_mnt_id_backup = DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE;
+          \t\tgoto bypass_orig_flow;
+          \t}
+          \tif (likely(is_current_zygote_domain) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {
+          \t\tmnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          \t\tgoto bypass_orig_flow;
+          \t}
+          \tif ((flag & CL_COPY_MNT_NS) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {
+          \t\tmnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          \t\tgoto bypass_orig_flow;
+          \t}
+          \tmnt = alloc_vfsmnt(old->mnt_devname, false, 0);
+          bypass_orig_flow:
+          #else
+          \tmnt = alloc_vfsmnt(old->mnt_devname);
+          #endif'''.replace("\n          ", "\n"),
+          )
+
+          # The upstream vfs_kern_mount hunk can match clone_mnt's similar block by fuzz.
+          wrong = '''#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \t// If caller process is zygote, then it is a normal mount, so we just reorder the mnt_id
+          \tif (susfs_is_current_zygote_domain()) {
+          \t\tmnt->mnt.susfs_mnt_id_backup = mnt->mnt_id;
+          \t\tmnt->mnt_id = current->susfs_last_fake_mnt_id++;
+          \t}
+          #endif'''.replace("\n          ", "\n")
+          correct = '''#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \t// If caller is zygote and this is not a namespace copy, reorder the mount ID.
+          \tif (likely(is_current_zygote_domain) && !(flag & CL_ZYGOTE_COPY_MNT_NS)) {
+          \t\tmnt->mnt.susfs_mnt_id_backup = mnt->mnt_id;
+          \t\tmnt->mnt_id = current->susfs_last_fake_mnt_id++;
+          \t}
+          #endif'''.replace("\n          ", "\n")
+          p = Path("fs/namespace.c")
+          text = p.read_text()
+          if text.count(wrong) != 1:
+              raise SystemExit(f"Expected one misapplied zygote hunk in clone_mnt(), found {text.count(wrong)}")
+          p.write_text(text.replace(wrong, correct, 1))
+
+          replace_once(
+              "fs/proc/task_mmu.c",
+              "#include <linux/ctype.h>\n",
+              "#include <linux/ctype.h>\n"
+              "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n"
+              "#include <linux/susfs_def.h>\n"
+              "#endif\n",
+          )
+          replace_once(
+              "include/linux/mount.h",
+              "\tANDROID_KABI_RESERVE(4);\n",
+              '''#ifdef CONFIG_KSU_SUSFS
+          \tANDROID_KABI_USE(4, u64 susfs_mnt_id_backup);
+          #else
+          \tANDROID_KABI_RESERVE(4);
+          #endif
+          #if defined(CONFIG_KSU_SUSFS) && !defined(ANDROID_KABI_RESERVE)
+          \tu64 susfs_mnt_id_backup;
+          #endif
+          '''.replace("\n          ", "\n"),
+          )
+          PY
+
+          grep -q 'susfs_is_current_ksu_domain' fs/namespace.c
+          grep -q 'CL_COPY_MNT_NS' fs/namespace.c
+          grep -q 'ANDROID_KABI_USE(4, u64 susfs_mnt_id_backup)' include/linux/mount.h
+          grep -q 'susfs_def.h' fs/proc/task_mmu.c
+          grep -q 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile
+          test -s fs/susfs.c
+          test -s include/linux/susfs.h
+
           for file in fs/namespace.c fs/proc/task_mmu.c include/linux/mount.h fs/Makefile; do
             mkdir -p "$DIAG/after-patch/$(dirname "$file")"
             cp "$file" "$DIAG/after-patch/$file"
           done
           git diff -- fs/namespace.c fs/proc/task_mmu.c include/linux/mount.h fs/Makefile \
             > "$DIAG/partial-kernel-diff.patch" || true
-          cat "$DIAG/patch-output.log"
-          if [ "$PATCH_STATUS" -ne 0 ] || [ -s "$DIAG/failed-hunks.rej" ]; then
-            echo 'ERROR: SUSFS patch is not fully compatible. Diagnostic files will be uploaded; refusing to build a partially patched kernel.' >&2
-            exit 1
-          fi
-          grep -q 'susfs' fs/Makefile
-          grep -q 'susfs' include/linux/mount.h || grep -q 'susfs' include/linux/susfs.h
 
       - name: Upload SUSFS patch diagnostics
         if: always()
