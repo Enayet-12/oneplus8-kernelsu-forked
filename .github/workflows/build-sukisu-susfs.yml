@@ -79,8 +79,10 @@ jobs:
           test -s "$SUSFS/50_add_susfs_in_kernel-4.19.patch"
           test -s "$SUSFS/fs/susfs.c"
           test -s "$SUSFS/include/linux/susfs.h"
+          test -s "$SUSFS/include/linux/susfs_def.h"
           install -m 0644 "$SUSFS/fs/susfs.c" fs/susfs.c
           install -m 0644 "$SUSFS/include/linux/susfs.h" include/linux/susfs.h
+          install -m 0644 "$SUSFS/include/linux/susfs_def.h" include/linux/susfs_def.h
 
           DIAG="$GITHUB_WORKSPACE/susfs-diagnostics"
           mkdir -p "$DIAG/original" "$DIAG/after-patch"
@@ -284,6 +286,7 @@ jobs:
           grep -q 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile
           test -s fs/susfs.c
           test -s include/linux/susfs.h
+          test -s include/linux/susfs_def.h
 
           for file in fs/namespace.c fs/proc/task_mmu.c include/linux/mount.h fs/Makefile; do
             mkdir -p "$DIAG/after-patch/$(dirname "$file")"
