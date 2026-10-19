@@ -99,8 +99,24 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
-          git clone --depth=1 --branch kernel-4.19 \
-            https://gitlab.com/simonpunk/susfs4ksu.git "$GITHUB_WORKSPACE/susfs4ksu"
+          SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
+          SUSFS_DIR="$GITHUB_WORKSPACE/susfs4ksu"
+          # GitLab occasionally returns a transient 5xx/overload response.
+          # Retry from a clean directory instead of failing the entire build immediately.
+          for attempt in 1 2 3 4 5; do
+            if git -c http.version=HTTP/1.1 clone --depth=1 --single-branch \
+              --branch kernel-4.19 "$SUSFS_REPO" "$SUSFS_DIR"; then
+              break
+            fi
+            rm -rf "$SUSFS_DIR"
+            if [ "$attempt" -eq 5 ]; then
+              echo "Unable to clone SUSFS after 5 attempts; GitLab may still be unavailable." >&2
+              exit 1
+            fi
+            delay=$((attempt * 15))
+            echo "SUSFS clone attempt $attempt failed; retrying in ${delay}s..." >&2
+            sleep "$delay"
+          done
           SUSFS="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches"
           test -s "$SUSFS/50_add_susfs_in_kernel-4.19.patch"
           test -s "$SUSFS/fs/susfs.c"
