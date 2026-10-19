@@ -111,16 +111,18 @@ jobs:
               )
 
           def guard_function(text, name):
-              marker = name + "("
-              pos = text.find(marker)
-              if pos < 0:
-                  raise SystemExit(f"Could not find {name} in {path}; refusing an uncertain edit.")
-              line_start = text.rfind("\n", 0, pos) + 1
-              # Avoid wrapping a function call instead of its definition.
-              brace = text.find("{", pos)
-              semicolon = text.find(";", pos)
-              if brace < 0 or (semicolon >= 0 and semicolon < brace):
-                  raise SystemExit(f"Could not locate the definition body for {name} in {path}.")
+              # Find the function *definition*, not an earlier call site.
+              # Function signatures in this source may span multiple lines.
+              definition = re.compile(
+                  r"(?m)^[ \t]*(?:(?:static|inline|noinline|__maybe_unused)\s+)*"
+                  r"[A-Za-z_][A-Za-z0-9_\s\*]*?\b" + re.escape(name) +
+                  r"\s*\([^;{}]*?\)\s*\{"
+              )
+              match = definition.search(text)
+              if not match:
+                  raise SystemExit(f"Could not find the definition of {name} in {path}; refusing an uncertain edit.")
+              line_start = text.rfind("\n", 0, match.start()) + 1
+              brace = text.find("{", match.start(), match.end())
               depth = 0
               end = None
               for i in range(brace, len(text)):
@@ -133,7 +135,7 @@ jobs:
                           break
               if end is None:
                   raise SystemExit(f"Unbalanced braces while locating {name} in {path}.")
-              before = text[max(0, line_start - 100):line_start]
+              before = text[max(0, line_start - 160):line_start]
               if "KERNEL_VERSION(5, 3, 0)" in before and "#if" in before:
                   return text
               body = text[line_start:end]
