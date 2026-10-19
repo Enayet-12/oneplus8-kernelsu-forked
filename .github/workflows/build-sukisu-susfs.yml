@@ -9,7 +9,8 @@ permissions:
 env:
   KERNEL_SOURCE: https://github.com/LineageOS/android_kernel_oneplus_sm8250.git
   KERNEL_BRANCH: lineage-24.0
-  KSU_BRANCH: builtin
+  # Pin a SUSFS-1.5.5-era SukiSU release compatible with the Linux 4.19 patch.
+  KSU_BRANCH: v4.1.3
   KPM_PATCH_VERSION: 0.13.9
 
 jobs:
@@ -82,7 +83,7 @@ jobs:
           # Linux 4.19 arm64 uses access_ok(type, addr, size), while this
           # KPM source uses the newer two-argument form.
           pattern = re.compile(
-              r'\baccess_ok\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*,\s*(sizeof\([^()]*\)|[A-Za-z_][A-Za-z0-9_.]*)\s*\)'
+              r'\baccess_ok\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*,\s*(sizeof\([^()]*\)|[A-Za-z_][A-Za-z0-9_.]*|\d+)\s*\)'
           )
           source, count = pattern.subn(r'access_ok(VERIFY_READ, \1, \2)', source)
           if count < 1:
@@ -313,6 +314,87 @@ jobs:
           test -s include/linux/susfs.h
           test -s include/linux/susfs_def.h
 
+          # Bridge SukiSU's newer dispatch API to SUSFS v1.5.5 on Linux 4.19.
+          cat > include/linux/susfs_ksu_compat.h <<'EOF'
+          #ifndef KSU_SUSFS_COMPAT_H
+          #define KSU_SUSFS_COMPAT_H
+          #include <linux/susfs.h>
+          #include <linux/susfs_def.h>
+
+          static inline void ksu_susfs_add_sus_path(void __user **p)
+          {
+          #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+              susfs_add_sus_path((struct st_susfs_sus_path __user *)*p);
+          #endif
+          }
+          static inline void ksu_susfs_add_sus_kstat(void __user **p)
+          {
+          #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+              susfs_add_sus_kstat((struct st_susfs_sus_kstat __user *)*p);
+          #endif
+          }
+          static inline void ksu_susfs_update_sus_kstat(void __user **p)
+          {
+          #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+              susfs_update_sus_kstat((struct st_susfs_sus_kstat __user *)*p);
+          #endif
+          }
+          static inline void ksu_susfs_set_uname(void __user **p)
+          {
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+              susfs_set_uname((struct st_susfs_uname __user *)*p);
+          #endif
+          }
+          static inline void ksu_susfs_set_cmdline(void __user **p)
+          {
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+              susfs_set_cmdline_or_bootconfig((char __user *)*p);
+          #endif
+          }
+          static inline void ksu_susfs_add_open_redirect(void __user **p)
+          {
+          #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+              susfs_add_open_redirect((struct st_susfs_open_redirect __user *)*p);
+          #endif
+          }
+
+          /* Newer commands absent from SUSFS v1.5.5. */
+          #ifndef CMD_SUSFS_ADD_SUS_PATH_LOOP
+          #define CMD_SUSFS_ADD_SUS_PATH_LOOP 0x7fff0001U
+          #endif
+          #ifndef CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS
+          #define CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x7fff0002U
+          #endif
+          #define susfs_add_sus_path(p) ksu_susfs_add_sus_path(p)
+          #define susfs_add_sus_path_loop(p) do { } while (0)
+          #define susfs_set_hide_sus_mnts_for_non_su_procs(p) do { } while (0)
+          #define susfs_add_sus_kstat(p) ksu_susfs_add_sus_kstat(p)
+          #define susfs_update_sus_kstat(p) ksu_susfs_update_sus_kstat(p)
+          #define susfs_set_uname(p) ksu_susfs_set_uname(p)
+          #define susfs_enable_log(p) susfs_set_log(true)
+          #define susfs_set_cmdline_or_bootconfig(p) ksu_susfs_set_cmdline(p)
+          #define susfs_add_open_redirect(p) ksu_susfs_add_open_redirect(p)
+          #define susfs_add_sus_map(p) do { } while (0)
+          #define susfs_set_avc_log_spoofing(p) do { } while (0)
+          #define susfs_get_enabled_features(p) do { } while (0)
+          #define susfs_show_variant(p) do { } while (0)
+          #define susfs_show_version(p) do { } while (0)
+          #define susfs_start_sdcard_monitor_fn() do { } while (0)
+          #endif
+          EOF
+
+          DISPATCH="drivers/kernelsu/supercall/dispatch.c"
+          test -s "$DISPATCH"
+          if ! grep -q 'linux/susfs_ksu_compat.h' "$DISPATCH"; then
+            sed -i '1i#include <linux/susfs_ksu_compat.h>' "$DISPATCH"
+          fi
+
+          # SELinux-hide needs kernel internals unavailable in Linux 4.19.
+          FEATURE_C="drivers/kernelsu/policy/feature.c"
+          if [ -f "$FEATURE_C" ] && ! grep -Rqs 'KSU_FEATURE_SELINUX_HIDE' drivers/kernelsu --include='*.h'; then
+            sed -i '/KSU_FEATURE_SELINUX_HIDE/d' "$FEATURE_C"
+          fi
+
           for file in fs/namespace.c fs/proc/task_mmu.c include/linux/mount.h fs/Makefile; do
             mkdir -p "$DIAG/after-patch/$(dirname "$file")"
             cp "$file" "$DIAG/after-patch/$file"
@@ -426,17 +508,45 @@ jobs:
           test -s fs/susfs.c
           grep -q 'susfs' fs/Makefile
 
-      - name: Build kernel
+      - name: Build kernel (save full compiler log)
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
+          LOG="$GITHUB_WORKSPACE/kernel-build.log"
+          set +e
           make -j"$(nproc --all)" O=out ARCH=arm64 CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
             LLVM_IAS=1 LD=ld.lld AR=llvm-ar NM=llvm-nm \
-            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            2>&1 | tee "$LOG"
+          BUILD_STATUS=${PIPESTATUS[0]}
+          set -e
+          {
+            echo '## Kernel build diagnostics'
+            echo
+            echo "Build exit code: $BUILD_STATUS"
+            echo
+            echo '### First compiler/build errors (if any)'
+            echo '```text'
+            grep -n -E 'fatal error:|error:|undefined reference|No rule to make target|make\[[0-9]+\]: \*\*\*' "$LOG" | head -n 100 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$BUILD_STATUS" -ne 0 ]; then
+            echo "Kernel build failed with exit code $BUILD_STATUS; full log will be uploaded as an artifact." >&2
+            exit "$BUILD_STATUS"
+          fi
           test -s out/arch/arm64/boot/Image
+
+      - name: Upload kernel build log
+        if: always() && hashFiles('kernel-build.log') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-log-${{ github.run_number }}
+          path: ${{ github.workspace }}/kernel-build.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Apply KPM patch
         run: |
