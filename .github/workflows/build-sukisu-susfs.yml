@@ -70,6 +70,27 @@ jobs:
           grep -q 'kernelsu' drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig
 
+      - name: Guard module namespace import for Linux 4.19
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+
+          path = Path("drivers/kernelsu/core/init.c")
+          source = path.read_text()
+          line = "MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);"
+          guarded = "#ifdef MODULE_IMPORT_NS\n" + line + "\n#endif /* MODULE_IMPORT_NS */"
+          if guarded in source:
+              print("MODULE_IMPORT_NS is already guarded for older kernels.")
+          elif line in source:
+              source = source.replace(line, guarded, 1)
+              path.write_text(source)
+              print("Guarded MODULE_IMPORT_NS: Linux 4.19 does not provide this newer module namespace macro.")
+          else:
+              raise SystemExit(f"Expected MODULE_IMPORT_NS line was not found in {path}; refusing an uncertain edit.")
+          PYCODE
+
       - name: Fix KPM access_ok API for Linux 4.19
         run: |
           set -euxo pipefail
