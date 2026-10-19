@@ -304,6 +304,28 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: Fix MSM driver strnstr API call
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+
+          path = Path("drivers/gpu/drm/msm/msm_drv.c")
+          source = path.read_text()
+          old = 'strnstr(dev_name(dev), "mdp")'
+          new = 'strnstr(dev_name(dev), "mdp", strlen(dev_name(dev)))'
+          count = source.count(old)
+          if count != 1:
+              raise SystemExit(
+                  f"Expected exactly one old two-argument strnstr call in {path}, found {count}; refusing an uncertain edit."
+              )
+          path.write_text(source.replace(old, new, 1))
+          if new not in path.read_text():
+              raise SystemExit("strnstr compatibility edit did not persist")
+          print(f"Updated {path}: supplied the required size_t bound to strnstr().")
+          PYCODE
+
       - name: Configure kernel
         run: |
           set -euxo pipefail
