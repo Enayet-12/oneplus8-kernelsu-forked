@@ -69,6 +69,31 @@ jobs:
           grep -q 'kernelsu' drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig
 
+      - name: Fix KPM access_ok API for Linux 4.19
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
+          import re
+          from pathlib import Path
+
+          path = Path("drivers/kernelsu/kpm/kpm.c")
+          source = path.read_text()
+          # Linux 4.19 arm64 uses access_ok(type, addr, size), while this
+          # KPM source uses the newer two-argument form.
+          pattern = re.compile(
+              r'\baccess_ok\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*,\s*(sizeof\([^()]*\)|[A-Za-z_][A-Za-z0-9_.]*)\s*\)'
+          )
+          source, count = pattern.subn(r'access_ok(VERIFY_READ, \1, \2)', source)
+          if count < 1:
+              raise SystemExit(f"No two-argument access_ok calls were updated in {path}; refusing an uncertain edit.")
+          path.write_text(source)
+          remaining = pattern.findall(path.read_text())
+          if remaining:
+              raise SystemExit(f"Two-argument access_ok calls remain in {path}: {remaining}")
+          print(f"Updated {count} access_ok calls for the Linux 4.19 three-argument API.")
+          PYCODE
+
       - name: Integrate SUSFS kernel-side patches for Linux 4.19
         run: |
           set -euxo pipefail
