@@ -399,6 +399,85 @@ jobs:
           #endif
           EOF
 
+          # The imported SUSFS patch adds fs/susfs.o but does not define its
+          # Kconfig symbols. Kconfig silently drops scripts/config options that
+          # have no declarations, which caused CONFIG_KSU_SUSFS to disappear.
+          if ! grep -q '^# KSU-SUSFS workflow options$' drivers/kernelsu/Kconfig; then
+            cat >> drivers/kernelsu/Kconfig <<'KSU_SUSFS_KCONFIG'
+
+          # KSU-SUSFS workflow options
+          config KSU_SUSFS
+              bool "KernelSU SUSFS support"
+              depends on KSU
+              default y
+
+          config KSU_SUSFS_SUS_PATH
+              bool "SUSFS suspicious path support"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_SUS_MOUNT
+              bool "SUSFS suspicious mount support"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_SUS_KSTAT
+              bool "SUSFS suspicious stat support"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_SPOOF_UNAME
+              bool "SUSFS uname spoofing"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_ENABLE_LOG
+              bool "SUSFS logging"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+              bool "Hide SUSFS symbols"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+              bool "SUSFS cmdline/bootconfig spoofing"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_OPEN_REDIRECT
+              bool "SUSFS open redirect"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_SUS_MAP
+              bool "SUSFS map support"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_TRY_UMOUNT
+              bool "SUSFS try-umount support"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+              bool "SUSFS auto-add KernelSU default mount"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+              bool "SUSFS auto-add suspicious bind mounts"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+              bool "SUSFS auto try-umount bind mounts"
+              depends on KSU_SUSFS
+              default y
+          KSU_SUSFS_KCONFIG
+          fi
+
           DISPATCH="drivers/kernelsu/supercall/dispatch.c"
           test -s "$DISPATCH"
           if ! grep -q 'linux/susfs_ksu_compat.h' "$DISPATCH"; then
