@@ -9,8 +9,8 @@ permissions:
 env:
   KERNEL_SOURCE: https://github.com/LineageOS/android_kernel_oneplus_sm8250.git
   KERNEL_BRANCH: lineage-24.0
-  # Pin a SUSFS-1.5.5-era SukiSU release compatible with the Linux 4.19 patch.
-  KSU_BRANCH: v4.1.3
+  # Use SukiSU-Ultra's manual-hook branch for a hand-patched non-GKI 4.19 kernel.
+  KSU_BRANCH: builtin
   KPM_PATCH_VERSION: 0.13.9
 
 jobs:
@@ -65,10 +65,49 @@ jobs:
             https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh \
             -o /tmp/sukisu-setup.sh
           bash /tmp/sukisu-setup.sh "$KSU_BRANCH"
+          # setup.sh can print a fallback message while returning success if
+          # checkout fails. Do not silently continue on the main/GKI-oriented branch.
+          ACTUAL_KSU_BRANCH="$(git -C KernelSU branch --show-current)"
+          if [ "$ACTUAL_KSU_BRANCH" != "$KSU_BRANCH" ]; then
+            echo "ERROR: expected SukiSU branch '$KSU_BRANCH', got '$ACTUAL_KSU_BRANCH'. Refusing a GKI/main-branch build." >&2
+            git -C KernelSU status --short --branch >&2 || true
+            exit 1
+          fi
+          git -C KernelSU log -1 --oneline
           test -d KernelSU/kernel
           test -e drivers/kernelsu
           grep -q 'kernelsu' drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig
+
+      - name: Backport seccomp syscall-count definition for Linux 4.19
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+
+          path = Path("drivers/kernelsu/infra/seccomp_cache.c")
+          source = path.read_text()
+          include = "#include <linux/seccomp.h>"
+          compatibility = "#include <asm/unistd.h>\n\n#ifndef SECCOMP_ARCH_NATIVE_NR\n#define SECCOMP_ARCH_NATIVE_NR NR_syscalls\n#endif /* SECCOMP_ARCH_NATIVE_NR */"
+
+          if "#ifndef SECCOMP_ARCH_NATIVE_NR" in source:
+              print("SECCOMP_ARCH_NATIVE_NR fallback already exists.")
+          else:
+              if include not in source:
+                  raise SystemExit(f"Expected {include} in {path}; refusing an uncertain edit.")
+              source = source.replace(include, include + "\n" + compatibility, 1)
+              path.write_text(source)
+
+          source = path.read_text()
+          if "#include <asm/unistd.h>" not in source:
+              raise SystemExit(f"asm/unistd.h include missing from {path}.")
+          if "#define SECCOMP_ARCH_NATIVE_NR NR_syscalls" not in source:
+              raise SystemExit(f"SECCOMP_ARCH_NATIVE_NR fallback missing from {path}.")
+          if source.count("#ifndef SECCOMP_ARCH_NATIVE_NR") != 1:
+              raise SystemExit(f"Unexpected duplicate fallback guards in {path}.")
+          print("Added Linux 4.19 fallback using the architecture's NR_syscalls value.")
+          PYCODE
 
       - name: Guard module namespace import for Linux 4.19
         run: |
@@ -497,74 +536,135 @@ jobs:
           test -s include/linux/susfs.h
           test -s include/linux/susfs_def.h
 
-          # Bridge SukiSU's newer dispatch API to SUSFS v1.5.5 on Linux 4.19.
+          # Build a real adapter over the SUSFS v1.5.5 APIs copied from the
+          # kernel-4.19 source branch. Do not fabricate missing functions as no-op
+          # macros: unsupported newer commands are removed from dispatch below.
           cat > include/linux/susfs_ksu_compat.h <<'EOF'
           #ifndef KSU_SUSFS_COMPAT_H
           #define KSU_SUSFS_COMPAT_H
+          #include <linux/errno.h>
           #include <linux/susfs.h>
           #include <linux/susfs_def.h>
 
-          static inline void ksu_susfs_add_sus_path(void __user **p)
+          static inline int ksu_susfs_dispatch_add_sus_path(void __user **arg)
           {
           #ifdef CONFIG_KSU_SUSFS_SUS_PATH
-              susfs_add_sus_path((struct st_susfs_sus_path __user *)*p);
+              return susfs_add_sus_path((struct st_susfs_sus_path __user *)*arg);
+          #else
+              return -EOPNOTSUPP;
           #endif
           }
-          static inline void ksu_susfs_add_sus_kstat(void __user **p)
+          static inline int ksu_susfs_dispatch_add_sus_kstat(void __user **arg)
           {
           #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
-              susfs_add_sus_kstat((struct st_susfs_sus_kstat __user *)*p);
+              return susfs_add_sus_kstat((struct st_susfs_sus_kstat __user *)*arg);
+          #else
+              return -EOPNOTSUPP;
           #endif
           }
-          static inline void ksu_susfs_update_sus_kstat(void __user **p)
+          static inline int ksu_susfs_dispatch_update_sus_kstat(void __user **arg)
           {
           #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
-              susfs_update_sus_kstat((struct st_susfs_sus_kstat __user *)*p);
+              return susfs_update_sus_kstat((struct st_susfs_sus_kstat __user *)*arg);
+          #else
+              return -EOPNOTSUPP;
           #endif
           }
-          static inline void ksu_susfs_set_uname(void __user **p)
+          static inline int ksu_susfs_dispatch_set_uname(void __user **arg)
           {
           #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
-              susfs_set_uname((struct st_susfs_uname __user *)*p);
+              return susfs_set_uname((struct st_susfs_uname __user *)*arg);
+          #else
+              return -EOPNOTSUPP;
           #endif
           }
-          static inline void ksu_susfs_set_cmdline(void __user **p)
+          static inline int ksu_susfs_dispatch_set_cmdline(void __user **arg)
           {
           #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-              susfs_set_cmdline_or_bootconfig((char __user *)*p);
+              return susfs_set_cmdline_or_bootconfig((char __user *)*arg);
+          #else
+              return -EOPNOTSUPP;
           #endif
           }
-          static inline void ksu_susfs_add_open_redirect(void __user **p)
+          static inline int ksu_susfs_dispatch_add_open_redirect(void __user **arg)
           {
           #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-              susfs_add_open_redirect((struct st_susfs_open_redirect __user *)*p);
+              return susfs_add_open_redirect((struct st_susfs_open_redirect __user *)*arg);
+          #else
+              return -EOPNOTSUPP;
           #endif
           }
-
-          /* Newer commands absent from SUSFS v1.5.5. */
-          #ifndef CMD_SUSFS_ADD_SUS_PATH_LOOP
-          #define CMD_SUSFS_ADD_SUS_PATH_LOOP 0x7fff0001U
+          static inline int ksu_susfs_dispatch_enable_log(void)
+          {
+          #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
+              susfs_set_log(true);
+              return 0;
+          #else
+              return -EOPNOTSUPP;
           #endif
-          #ifndef CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS
-          #define CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x7fff0002U
-          #endif
-          #define susfs_add_sus_path(p) ksu_susfs_add_sus_path(p)
-          #define susfs_add_sus_path_loop(p) do { } while (0)
-          #define susfs_set_hide_sus_mnts_for_non_su_procs(p) do { } while (0)
-          #define susfs_add_sus_kstat(p) ksu_susfs_add_sus_kstat(p)
-          #define susfs_update_sus_kstat(p) ksu_susfs_update_sus_kstat(p)
-          #define susfs_set_uname(p) ksu_susfs_set_uname(p)
-          #define susfs_enable_log(p) susfs_set_log(true)
-          #define susfs_set_cmdline_or_bootconfig(p) ksu_susfs_set_cmdline(p)
-          #define susfs_add_open_redirect(p) ksu_susfs_add_open_redirect(p)
-          #define susfs_add_sus_map(p) do { } while (0)
-          #define susfs_set_avc_log_spoofing(p) do { } while (0)
-          #define susfs_get_enabled_features(p) do { } while (0)
-          #define susfs_show_variant(p) do { } while (0)
-          #define susfs_show_version(p) do { } while (0)
-          #define susfs_start_sdcard_monitor_fn() do { } while (0)
-          #endif
+          }
+          #endif /* KSU_SUSFS_COMPAT_H */
           EOF
+
+          # Adapt the actual dispatch call sites to the real SUSFS prototypes.
+          # Unsupported commands are removed, not mapped to fake success handlers.
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          path = Path("drivers/kernelsu/supercall/dispatch.c")
+          source = path.read_text()
+          if '#include <linux/susfs_ksu_compat.h>' not in source:
+              source = '#include <linux/susfs_ksu_compat.h>\n' + source
+
+          call_replacements = {
+              r'susfs_add_sus_path\(arg\);\s*return 0;': 'return ksu_susfs_dispatch_add_sus_path(arg);',
+              r'susfs_add_sus_kstat\(arg\);\s*return 0;': 'return ksu_susfs_dispatch_add_sus_kstat(arg);',
+              r'susfs_update_sus_kstat\(arg\);\s*return 0;': 'return ksu_susfs_dispatch_update_sus_kstat(arg);',
+              r'susfs_set_uname\(arg\);\s*return 0;': 'return ksu_susfs_dispatch_set_uname(arg);',
+              r'susfs_enable_log\(arg\);\s*return 0;': 'return ksu_susfs_dispatch_enable_log();',
+              r'susfs_set_cmdline_or_bootconfig\(arg\);\s*return 0;': 'return ksu_susfs_dispatch_set_cmdline(arg);',
+              r'susfs_add_open_redirect\(arg\);\s*return 0;': 'return ksu_susfs_dispatch_add_open_redirect(arg);',
+          }
+          for pattern, replacement in call_replacements.items():
+              source, count = re.subn(pattern, replacement, source)
+              if count == 0 and replacement not in source:
+                  raise SystemExit(f"Expected SUSFS dispatch call not found in {path}: {pattern}")
+
+          # These commands are not implemented by the actual SUSFS kernel-4.19
+          # source branch. Delete their case blocks so they cannot report success
+          # without doing work. The manager will receive the dispatch default error.
+          unsupported_case_patterns = [
+              r'\s*case CMD_SUSFS_ADD_SUS_PATH_LOOP:\s*susfs_add_sus_path_loop\(arg\);\s*return 0;\s*',
+              r'\s*case CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS:\s*susfs_set_hide_sus_mnts_for_non_su_procs\(arg\);\s*return 0;\s*',
+              r'\s*case CMD_SUSFS_ADD_SUS_MAP:\s*susfs_add_sus_map\(arg\);\s*return 0;\s*',
+              r'\s*case CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING:\s*susfs_set_avc_log_spoofing\(arg\);\s*return 0;\s*',
+              r'\s*case CMD_SUSFS_SHOW_ENABLED_FEATURES:\s*susfs_get_enabled_features\(arg\);\s*return 0;\s*',
+              r'\s*case CMD_SUSFS_SHOW_VARIANT:\s*susfs_show_variant\(arg\);\s*return 0;\s*',
+              r'\s*case CMD_SUSFS_SHOW_VERSION:\s*susfs_show_version\(arg\);\s*return 0;\s*',
+          ]
+          for pattern in unsupported_case_patterns:
+              source, count = re.subn(pattern, '\n', source)
+              if count > 1:
+                  raise SystemExit(f"Unexpected duplicate unsupported SUSFS command cases for {pattern}: {count}")
+
+          # The SD-card monitor is not part of SUSFS v1.5.5's exported API.
+          source, monitor_count = re.subn(r'^\s*susfs_start_sdcard_monitor_fn\(\);\s*\n', '', source, flags=re.M)
+          path.write_text(source)
+
+          # Do not let unsupported calls survive as silent macros or implicit declarations.
+          forbidden = (
+              'susfs_add_sus_path_loop', 'susfs_set_hide_sus_mnts_for_non_su_procs',
+              'susfs_add_sus_map', 'susfs_set_avc_log_spoofing',
+              'susfs_get_enabled_features', 'susfs_show_variant',
+              'susfs_show_version', 'susfs_start_sdcard_monitor_fn',
+          )
+          remaining = [name for name in forbidden if name in source]
+          if remaining:
+              raise SystemExit(f"Unsupported SUSFS calls remain in {path}: {remaining}")
+          print("SUSFS dispatch now calls real kernel-4.19 SUSFS APIs; unsupported commands are not fake no-ops.")
+          print(f"Removed {monitor_count} unsupported SD-card-monitor call(s).")
+          PYCODE
 
           # The imported SUSFS patch adds fs/susfs.o but does not define its
           # Kconfig symbols. Kconfig silently drops scripts/config options that
@@ -694,6 +794,96 @@ jobs:
               raise SystemExit("strnstr compatibility edit did not persist")
           print(f"Updated {path}: supplied the required size_t bound to strnstr().")
           PYCODE
+
+      - name: Audit version-sensitive SukiSU APIs against Linux 4.19 source
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          root = Path(".")
+          ksu = root / "drivers/kernelsu"
+          if not ksu.exists():
+              raise SystemExit("drivers/kernelsu is missing; SukiSU integration did not complete")
+
+          # This is a targeted inventory, not a claim that static scanning can
+          # prove full API compatibility. The compiler remains authoritative.
+          symbols = [
+              "SECCOMP_ARCH_NATIVE_NR", "NR_syscalls", "MODULE_IMPORT_NS",
+              "access_ok", "strnstr", "iopoll", "remap_file_range",
+              "ksu_wrapper_iopoll", "ksu_wrapper_remap_file_range",
+              "SUSFS_MAGIC", "KSU_FEATURE_SELINUX_HIDE",
+              "susfs_start_sdcard_monitor_fn", "susfs_enable_log",
+              "susfs_set_cmdline_or_bootconfig",
+              "CMD_SUSFS_ADD_SUS_PATH_LOOP",
+              "susfs_add_sus_path_loop",
+              "CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS",
+          ]
+          source_exts = {".c", ".h", ".S", ".s", ".inc"}
+          ksu_files = [p for p in ksu.rglob("*") if p.is_file() and p.suffix in source_exts]
+          kernel_files = [p for p in root.rglob("*") if p.is_file() and p.suffix in source_exts
+                          and ".git" not in p.parts and "out" not in p.parts]
+
+          # Read source files once; repeatedly reopening the entire kernel tree
+          # for every symbol would make this audit unnecessarily slow.
+          def load_lines(files):
+              loaded = []
+              for file in files:
+                  try:
+                      loaded.append((file, file.read_text(errors="ignore").splitlines()))
+                  except OSError:
+                      pass
+              return loaded
+
+          ksu_sources = load_lines(ksu_files)
+          kernel_sources = load_lines(kernel_files)
+
+          report = [
+              "# SukiSU / Linux 4.19 API compatibility inventory", "",
+              "This is a heuristic source inventory. Presence of a token does not prove API compatibility; absence does not prove a build failure.",
+              "Review each occurrence and use the compiler log for authoritative diagnostics.", "",
+          ]
+          for symbol in symbols:
+              uses = []
+              for f, lines in ksu_sources:
+                  for number, line in enumerate(lines, 1):
+                      if re.search(r"\b" + re.escape(symbol) + r"\b", line):
+                          uses.append(f"{f}:{number}: {line.strip()}")
+              if not uses:
+                  continue
+              found_outside_ksu = []
+              for f, lines in kernel_sources:
+                  if f.is_relative_to(ksu):
+                      continue
+                  for number, line in enumerate(lines, 1):
+                      if re.search(r"\b" + re.escape(symbol) + r"\b", line):
+                          found_outside_ksu.append(f"{f}:{number}: {line.strip()}")
+              report += [f"## `{symbol}`", "", "SukiSU occurrences:"]
+              report += [f"- `{x}`" for x in uses[:30]]
+              if len(uses) > 30:
+                  report.append(f"- ... {len(uses) - 30} additional occurrence(s)")
+              report += ["", "Occurrences elsewhere in the kernel tree (may be declarations, uses, or comments):"]
+              report += [f"- `{x}`" for x in found_outside_ksu[:30]] if found_outside_ksu else ["- No matching token found outside SukiSU."]
+              if len(found_outside_ksu) > 30:
+                  report.append(f"- ... {len(found_outside_ksu) - 30} additional occurrence(s)")
+              report.append("")
+
+          import os
+          out = Path(os.environ["GITHUB_WORKSPACE"]) / "sukisu-linux419-api-audit.md"
+          out.write_text("\n".join(report) + "\n")
+          print(f"Wrote compatibility inventory: {out}")
+          PYCODE
+
+      - name: Upload SukiSU Linux 4.19 API audit
+        if: always() && hashFiles('sukisu-linux419-api-audit.md') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: sukisu-linux419-api-audit-${{ github.run_number }}
+          path: ${{ github.workspace }}/sukisu-linux419-api-audit.md
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Configure kernel
         run: |
