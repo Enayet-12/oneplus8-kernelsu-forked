@@ -1154,6 +1154,51 @@ jobs:
           test -s fs/susfs.c
           grep -q 'susfs' fs/Makefile
 
+      - name: Resolve duplicate OnePlus display and Synaptics symbols
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          grep -qx 'CONFIG_ARCH_KONA=y' out/.config || {
+            echo 'ERROR: expected CONFIG_ARCH_KONA=y for this SM8250 device build' >&2
+            exit 1
+          }
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          # This vendor SM8250 tree uses techpack/display for its Kona display
+          # stack. The generic drivers/gpu/drm/msm Makefile uses the same
+          # CONFIG_DRM_MSM symbol, so both implementations were being linked.
+          display_mk = Path("drivers/gpu/drm/msm/Makefile")
+          text = display_mk.read_text()
+          target = "obj-$(CONFIG_DRM_MSM) += msm.o"
+          guarded = "ifneq ($(CONFIG_ARCH_KONA),y)\n" + target + "\nendif"
+          if guarded not in text:
+              pattern = r"(?m)^obj-\$\(CONFIG_DRM_MSM\)\s*\+=\s*msm\.o\s*$"
+              text, count = re.subn(pattern, "# Use techpack/display's vendor MSM stack on Kona.\n" + guarded, text)
+              if count != 1:
+                  raise SystemExit(f"Expected one generic DRM_MSM build rule in {display_mk}, found {count}")
+              display_mk.write_text(text)
+              print("Disabled the duplicate generic DRM_MSM target on ARCH_KONA; retained techpack/display")
+          else:
+              print("Generic DRM_MSM target already guarded for ARCH_KONA")
+
+          # Both Synaptics TCM implementations need their own completion object.
+          # The Oplus on-cell driver's completion is only referenced in this C file,
+          # so give it internal linkage rather than colliding with the generic core.
+          touch = Path("drivers/input/touchscreen/oplus_touchscreen/Synaptics/Syna_tcm_oncell/synaptics_tcm_oncell.c")
+          source = touch.read_text()
+          static_declaration = "static DECLARE_COMPLETION(response_complete);"
+          if static_declaration not in source:
+              source, count = re.subn(r"(?m)^DECLARE_COMPLETION\(response_complete\);$", static_declaration, source)
+              if count != 1:
+                  raise SystemExit(f"Expected one response_complete declaration in {touch}, found {count}")
+              touch.write_text(source)
+              print("Scoped the Oplus Synaptics response completion to its own driver")
+          else:
+              print("Oplus Synaptics response completion already has internal linkage")
+          PYCODE
+
       - name: Build kernel (save full compiler log)
         run: |
           set -euxo pipefail
