@@ -167,20 +167,32 @@ jobs:
                   return text[:declaration_start] + text[body_end:], True
 
           for function in ("ksu_wrapper_iopoll", "ksu_wrapper_remap_file_range"):
-              source, removed = remove_definition(source, function)
-              if not removed:
-                  print(f"No definition of {function} found; checking for stale references.")
-
-          # Remove only C-code lines that reference the unavailable callbacks or
-          # their associated constant. Never remove preprocessor directives.
-          kept_lines = []
-          for line in source.splitlines(keepends=True):
-              if line.lstrip().startswith("#"):
-                  kept_lines.append(line)
-              elif re.search(r"\b(?:iopoll|remap_file_range|REMAP_FILE_DEDUP)\b", line):
-                  continue
+              # The upstream source can define the same wrapper in multiple
+              # mutually exclusive kernel-version branches. Remove EVERY
+              # definition, not just the first one, or the later body can be
+              # left behind with its return statement accidentally stripped.
+              removed_count = 0
+              while True:
+                  source, removed = remove_definition(source, function)
+                  if not removed:
+                      break
+                  removed_count += 1
+              if removed_count == 0:
+                  print(f"No definition of {function} found; checking for stale assignments.")
               else:
-                  kept_lines.append(line)
+                  print(f"Removed {removed_count} definition(s) of {function}.")
+
+          # Remove only the file_operations assignments for fields absent from
+          # Linux 4.19. Do NOT delete every line mentioning these names: that
+          # can strip a return statement from a still-present non-void function.
+          kept_lines = []
+          assignment_pattern = re.compile(
+              r"\bops\.(?:iopoll|remap_file_range)\s*="
+          )
+          for line in source.splitlines(keepends=True):
+              if not line.lstrip().startswith("#") and assignment_pattern.search(line):
+                  continue
+              kept_lines.append(line)
           source = "".join(kept_lines)
 
           # Validate conditional structure, but never 'repair' it by deleting
@@ -208,9 +220,13 @@ jobs:
           if pp_stack:
               raise SystemExit(f"Unclosed preprocessor conditional(s) in {path}: {pp_stack}")
 
+          # Ignore comments when checking for stale identifiers; upstream has
+          # explanatory comments mentioning REMAP_FILE_DEDUP outside the code
+          # being removed.
+          code_only = re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.S)
           leftovers = [
               f"{number}: {line.strip()}"
-              for number, line in enumerate(source.splitlines(), 1)
+              for number, line in enumerate(code_only.splitlines(), 1)
               if not line.lstrip().startswith("#")
               and re.search(r"\b(?:iopoll|remap_file_range|REMAP_FILE_DEDUP)\b", line)
           ]
