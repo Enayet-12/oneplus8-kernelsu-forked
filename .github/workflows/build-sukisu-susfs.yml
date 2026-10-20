@@ -831,6 +831,118 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: Adapt SukiSU v4.2.1 to Linux 4.19 and SUSFS v1.5.5 APIs
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          root = Path("drivers/kernelsu")
+          if not root.is_dir():
+              raise SystemExit("SukiSU source directory is missing")
+
+          # 1) Linux 4.19 struct clocksource has no vdso_clock_mode member.
+          # Disable only this newer VDSO-specific assignment when the actual
+          # kernel header does not provide the field; retain the rest of CPU spoof.
+          clocksource_h = Path("include/linux/clocksource.h").read_text(errors="replace")
+          if "vdso_clock_mode" not in clocksource_h:
+              candidates = [p for p in root.rglob("*.c") if "vdso_clock_mode" in p.read_text(errors="ignore")]
+              for path in candidates:
+                  source = path.read_text()
+                  source, count = re.subn(r"\(\*curr_cs_ptr\)->vdso_clock_mode\s*=\s*[^;]+;", "/* VDSO clock-mode spoofing unavailable on this Linux 4.19 clocksource API. */", source, flags=re.S)
+                  if count == 0 and "vdso_clock_mode" in source:
+                      raise SystemExit(f"Found vdso_clock_mode in {path}, but could not safely isolate its assignment")
+                  path.write_text(source)
+                  print(f"Disabled {count} unsupported VDSO clock-mode assignment(s) in {path}")
+
+          # 2) Remove the SELinux-hide feature-table entry only if this checkout
+          # has no actual enum declaration for it. Also guard runtime call sites;
+          # this older kernel integration does not provide those functions.
+          feature_h = root / "include/uapi/feature.h"
+          feature_c = root / "policy/feature.c"
+          enum_declared = feature_h.is_file() and bool(re.search(r"\bKSU_FEATURE_SELINUX_HIDE\s*=", feature_h.read_text(errors="ignore")))
+          if feature_c.is_file() and not enum_declared:
+              source = feature_c.read_text()
+              source, count = re.subn(r"^\s*\[KSU_FEATURE_SELINUX_HIDE\]\s*=\s*[^\n]*\n", "", source, flags=re.M)
+              feature_c.write_text(source)
+              print(f"Removed {count} unsupported SELinux-hide feature-table entry/entries")
+
+          for path in root.rglob("*.c"):
+              source = path.read_text(errors="ignore")
+              original = source
+              for call in ("ksu_selinux_hide_handle_post_fs_data", "ksu_selinux_hide_handle_second_stage"):
+                  # These APIs are absent from this SukiSU/Linux 4.19 source combination.
+                  source = re.sub(r"^(\s*)" + re.escape(call) + r"\(\);\s*$",
+                                  r"\1/* SELinux-hide hook unavailable in this kernel integration. */", source, flags=re.M)
+              if source != original:
+                  path.write_text(source)
+                  print(f"Disabled unavailable SELinux-hide hook call(s) in {path}")
+
+          # 3) SUSFS v1.5.5 uses this userspace ABI magic, but its kernel headers
+          # do not define the constant consumed by SukiSU's supercall dispatcher.
+          compat = Path("include/linux/susfs_ksu_compat.h")
+          if compat.is_file():
+              source = compat.read_text()
+              if "#define SUSFS_MAGIC" not in source:
+                  source = source.replace("#define KSU_SUSFS_COMPAT_H\n",
+                                          "#define KSU_SUSFS_COMPAT_H\n#ifndef SUSFS_MAGIC\n#define SUSFS_MAGIC 0xFAFAFAFAU\n#endif\n", 1)
+                  compat.write_text(source)
+                  print("Added the documented SUSFS userspace ABI magic to the compatibility header")
+
+          # 4) These per-process state APIs are not implemented by the kernel-4.19
+          # SUSFS v1.5.5 source. Keep the call sites available for a future matching
+          # SUSFS implementation, but do not compile calls to absent symbols.
+          missing_state_apis = (
+              "susfs_set_current_proc_no_su",
+              "susfs_set_current_proc_umounted",
+              "susfs_set_current_proc_umounted_for_zygote_next",
+          )
+          for path in root.rglob("*.c"):
+              source = path.read_text(errors="ignore")
+              original = source
+              for api in missing_state_apis:
+                  # Guard individual call statements. This is not a fake function or
+                  # success stub; the newer per-process state feature is disabled.
+                  source = re.sub(r"^(\s*)" + re.escape(api) + r"\(\);\s*$",
+                                  r"#ifdef CONFIG_KSU_SUSFS_TASK_STATE_API\n\1" + api + r"();\n#endif /* CONFIG_KSU_SUSFS_TASK_STATE_API */",
+                                  source, flags=re.M)
+              if source != original:
+                  path.write_text(source)
+                  print(f"Guarded unsupported SUSFS task-state calls in {path}")
+
+          # 5) The newer adb-root helper names are not exported by SUSFS v1.5.5.
+          # Replace them with local, real string comparisons (not SUSFS stubs).
+          adb_candidates = [p for p in root.rglob("adb_root.c") if "susfs_starts_with" in p.read_text(errors="ignore") or "susfs_ends_with" in p.read_text(errors="ignore")]
+          for path in adb_candidates:
+              source = path.read_text()
+              if "ksu_compat_path_starts_with" not in source:
+                  includes = list(re.finditer(r"^#include[^\n]*\n", source, flags=re.M))
+                  insert_at = includes[-1].end() if includes else 0
+                  helpers = (
+                      "\n#include <linux/string.h>\n"
+                      "static bool ksu_compat_path_starts_with(const char *s, const char *prefix)\n"
+                      "{ return s && prefix && !strncmp(s, prefix, strlen(prefix)); }\n"
+                      "static bool ksu_compat_path_ends_with(const char *s, const char *suffix)\n"
+                      "{ size_t sl, pl; if (!s || !suffix) return false; sl = strlen(s); pl = strlen(suffix); return sl >= pl && !strcmp(s + sl - pl, suffix); }\n"
+                  )
+                  source = source[:insert_at] + helpers + source[insert_at:]
+              source = source.replace("susfs_starts_with(", "ksu_compat_path_starts_with(")
+              source = source.replace("susfs_ends_with(", "ksu_compat_path_ends_with(")
+              path.write_text(source)
+              print(f"Replaced unavailable SUSFS string helpers in {path}")
+
+          # Ensure the unresolved identifiers from the reported build are either
+          # genuinely handled or reported as an explicit integration limitation.
+          feature_source = feature_c.read_text(errors="ignore") if feature_c.is_file() else ""
+          if not enum_declared and "KSU_FEATURE_SELINUX_HIDE" in feature_source:
+              raise SystemExit("KSU_FEATURE_SELINUX_HIDE remains in feature.c without an enum definition")
+          print("Compatibility pass complete. Note: SUSFS v1.5.5 cannot provide the newer per-process task-state or SELinux-hide features without a matching implementation.")
+          PYCODE
+          echo "::warning::SUSFS v1.5.5 lacks SukiSU's newer per-process task-state APIs; those hooks are conditionally disabled rather than replaced with fake stubs."
+          echo "::warning::SELinux-hide hooks and VDSO clock-mode spoofing are unavailable in this Linux 4.19 source combination."
+
       - name: Fix MSM driver strnstr API call
         run: |
           set -euxo pipefail
