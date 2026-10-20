@@ -91,7 +91,7 @@ jobs:
               raise SystemExit(f"Expected MODULE_IMPORT_NS line was not found in {path}; refusing an uncertain edit.")
           PYCODE
 
-      - name: Guard newer file_operations callbacks for Linux 4.19
+      - name: Remove unsupported file_operations callbacks for Linux 4.19
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
@@ -101,63 +101,75 @@ jobs:
 
           path = Path("drivers/kernelsu/infra/file_wrapper.c")
           source = path.read_text()
-          guard = "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0)"
 
-          if "#include <linux/version.h>" not in source:
-              source = source.replace(
-                  "#include <linux/",
-                  "#include <linux/version.h>\n#include <linux/",
-                  1,
-              )
+          def remove_definition(text, name):
+              # Find a real definition by requiring the balanced parameter list
+              # to be followed by an opening brace. This avoids matching calls.
+              search_from = 0
+              while True:
+                  match = re.search(r"\b" + re.escape(name) + r"\s*\(", text[search_from:])
+                  if not match:
+                      return text, False
+                  start = search_from + match.start()
+                  open_paren = text.find("(", start)
+                  depth = 0
+                  close_paren = None
+                  for i in range(open_paren, len(text)):
+                      if text[i] == "(":
+                          depth += 1
+                      elif text[i] == ")":
+                          depth -= 1
+                          if depth == 0:
+                              close_paren = i
+                              break
+                  if close_paren is None:
+                      raise SystemExit(f"Unbalanced parameter list while locating {name} in {path}.")
+                  after = close_paren + 1
+                  while after < len(text) and text[after].isspace():
+                      after += 1
+                  if after >= len(text) or text[after] != "{":
+                      search_from = close_paren + 1
+                      continue
+                  line_start = text.rfind("\n", 0, start) + 1
+                  brace_depth = 0
+                  end = None
+                  for i in range(after, len(text)):
+                      if text[i] == "{":
+                          brace_depth += 1
+                      elif text[i] == "}":
+                          brace_depth -= 1
+                          if brace_depth == 0:
+                              end = i + 1
+                              break
+                  if end is None:
+                      raise SystemExit(f"Unbalanced function body while locating {name} in {path}.")
+                  # Remove the full definition, not just the line containing its call.
+                  if end < len(text) and text[end] == "\n":
+                      end += 1
+                  return text[:line_start] + text[end:], True
 
-          def guard_function(text, name):
-              # Find the function *definition*, not an earlier call site.
-              # Function signatures in this source may span multiple lines.
-              definition = re.compile(
-                  r"(?m)^[ \t]*(?:(?:static|inline|noinline|__maybe_unused)\s+)*"
-                  r"[A-Za-z_][A-Za-z0-9_\s\*]*?\b" + re.escape(name) +
-                  r"\s*\([^;{}]*?\)\s*\{"
-              )
-              match = definition.search(text)
-              if not match:
-                  raise SystemExit(f"Could not find the definition of {name} in {path}; refusing an uncertain edit.")
-              line_start = text.rfind("\n", 0, match.start()) + 1
-              brace = text.find("{", match.start(), match.end())
-              depth = 0
-              end = None
-              for i in range(brace, len(text)):
-                  if text[i] == "{":
-                      depth += 1
-                  elif text[i] == "}":
-                      depth -= 1
-                      if depth == 0:
-                          end = i + 1
-                          break
-              if end is None:
-                  raise SystemExit(f"Unbalanced braces while locating {name} in {path}.")
-              before = text[max(0, line_start - 160):line_start]
-              if "KERNEL_VERSION(5, 3, 0)" in before and "#if" in before:
-                  return text
-              body = text[line_start:end]
-              return text[:line_start] + guard + "\n" + body + "\n#endif /* Linux 5.3+ file_operations callbacks */" + text[end:]
+          # These callbacks and their file_operations members are absent from
+          # the target Linux 4.19 tree. Remove their wrappers instead of relying
+          # on fragile version guards that can leave field accesses unguarded.
+          for function in ("ksu_wrapper_iopoll", "ksu_wrapper_remap_file_range"):
+              source, removed = remove_definition(source, function)
+              if not removed:
+                  print(f"No definition of {function} found; checking for stale references.")
 
-          # Both callbacks are absent from this device's Linux 4.19 file_operations.
-          source = guard_function(source, "ksu_wrapper_iopoll")
-          source = guard_function(source, "ksu_wrapper_remap_file_range")
+          # Remove callback assignments and any remaining references to these
+          # unavailable members/constants. Other file-wrapper callbacks remain intact.
+          kept_lines = []
+          for line in source.splitlines(keepends=True):
+              if re.search(r"\b(iopoll|remap_file_range|REMAP_FILE_DEDUP)\b", line):
+                  continue
+              kept_lines.append(line)
+          source = "".join(kept_lines)
 
-          for field in ("iopoll", "remap_file_range"):
-              pattern = re.compile(r"^([ \t]*)(p->ops\." + re.escape(field) + r"[ \t]*=.*;[ \t]*)$", re.M)
-              def wrap_assignment(match):
-                  line = match.group(0)
-                  if "KERNEL_VERSION(5, 3, 0)" in source[max(0, match.start()-120):match.start()]:
-                      return line
-                  return match.group(1) + guard + "\n" + line + "\n" + match.group(1) + "#endif /* Linux 5.3+ file_operations callbacks */"
-              source, count = pattern.subn(wrap_assignment, source, count=1)
-              if count != 1:
-                  raise SystemExit(f"Expected exactly one p->ops.{field} assignment in {path}, found {count}.")
-
+          leftovers = re.findall(r"\b(?:iopoll|remap_file_range|REMAP_FILE_DEDUP)\b", source)
+          if leftovers:
+              raise SystemExit(f"Unsupported callback references remain in {path}: {leftovers}")
           path.write_text(source)
-          print("Guarded iopoll/remap_file_range wrappers and assignments for Linux 4.19.")
+          print("Removed all iopoll/remap_file_range references from file_wrapper.c for Linux 4.19.")
           PYCODE
 
       - name: Fix KPM access_ok API for Linux 4.19
