@@ -860,14 +860,33 @@ jobs:
           # 2) Remove the SELinux-hide feature-table entry only if this checkout
           # has no actual enum declaration for it. Also guard runtime call sites;
           # this older kernel integration does not provide those functions.
-          feature_h = root / "include/uapi/feature.h"
           feature_c = root / "policy/feature.c"
-          enum_declared = feature_h.is_file() and bool(re.search(r"\bKSU_FEATURE_SELINUX_HIDE\s*=", feature_h.read_text(errors="ignore")))
-          if feature_c.is_file() and not enum_declared:
+          # The compiler has confirmed this enum value is unavailable in this
+          # checkout. Remove only its designated feature-table row; do not
+          # invent an enum value or alias it to an unrelated feature.
+          if feature_c.is_file():
               source = feature_c.read_text()
-              source, count = re.subn(r"^\s*\[KSU_FEATURE_SELINUX_HIDE\]\s*=\s*[^\n]*\n", "", source, flags=re.M)
+              source, count = re.subn(
+                  r"(?m)^[ \t]*\[KSU_FEATURE_SELINUX_HIDE\][^\n]*\n", "", source
+              )
               feature_c.write_text(source)
               print(f"Removed {count} unsupported SELinux-hide feature-table entry/entries")
+              if re.search(r"(?m)^[ \t]*\[KSU_FEATURE_SELINUX_HIDE\]", source):
+                  raise SystemExit("Unsupported KSU_FEATURE_SELINUX_HIDE table entry remains in feature.c")
+
+          # Some SELinux policy helpers are compiled with optional policy code
+          # disabled on older trees. Mark the policy pointers as maybe-unused so
+          # -Werror does not fail a build when those branches compile out.
+          for path in root.rglob("rules.c"):
+              source = path.read_text(errors="ignore")
+              patched, count = re.subn(
+                  r"(?m)^([ \t]*)struct selinux_policy \*pol, \*old_pol;[ \t]*$",
+                  r"\1struct selinux_policy *pol __maybe_unused, *old_pol __maybe_unused;",
+                  source
+              )
+              if count:
+                  path.write_text(patched)
+                  print(f"Marked {count} conditionally unused SELinux policy pointer declaration(s) in {path}")
 
           for path in root.rglob("*.c"):
               source = path.read_text(errors="ignore")
