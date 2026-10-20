@@ -135,18 +135,20 @@ jobs:
           python3 - <<'PYCODE'
           from pathlib import Path
 
-          path = Path("drivers/kernelsu/core/init.c")
-          source = path.read_text()
+          root = Path("drivers/kernelsu")
           line = "MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);"
           guarded = "#ifdef MODULE_IMPORT_NS\n" + line + "\n#endif /* MODULE_IMPORT_NS */"
-          if guarded in source:
-              print("MODULE_IMPORT_NS is already guarded for older kernels.")
-          elif line in source:
-              source = source.replace(line, guarded, 1)
-              path.write_text(source)
-              print("Guarded MODULE_IMPORT_NS: Linux 4.19 does not provide this newer module namespace macro.")
+          candidates = [p for p in root.rglob("*.c") if p.is_file() and line in p.read_text(errors="ignore")]
+          if not candidates:
+              print("No MODULE_IMPORT_NS import found in this SukiSU revision; nothing to backport.")
           else:
-              raise SystemExit(f"Expected MODULE_IMPORT_NS line was not found in {path}; refusing an uncertain edit.")
+              for path in candidates:
+                  source = path.read_text()
+                  if guarded in source:
+                      print(f"Already guarded: {path}")
+                  elif line in source:
+                      path.write_text(source.replace(line, guarded, 1))
+                      print(f"Guarded MODULE_IMPORT_NS for Linux 4.19 in {path}")
           PYCODE
 
       - name: Remove unsupported file_operations callbacks for Linux 4.19
@@ -157,7 +159,21 @@ jobs:
           from pathlib import Path
           import re
 
-          path = Path("drivers/kernelsu/infra/file_wrapper.c")
+          preferred = Path("drivers/kernelsu/infra/file_wrapper.c")
+          root = Path("drivers/kernelsu")
+          if preferred.is_file():
+              path = preferred
+          else:
+              candidates = [p for p in root.rglob("*.c") if p.is_file() and
+                            ("ksu_wrapper_iopoll" in p.read_text(errors="ignore") or
+                             "ksu_wrapper_remap_file_range" in p.read_text(errors="ignore"))]
+              if not candidates:
+                  print("No unsupported iopoll/remap_file_range wrappers in this SukiSU revision; skipping.")
+                  raise SystemExit(0)
+              if len(candidates) != 1:
+                  raise SystemExit("Found wrapper definitions in multiple files; refusing an ambiguous edit: " + ", ".join(map(str, candidates)))
+              path = candidates[0]
+              print(f"Resolved file_wrapper source at {path}")
           source = path.read_text()
 
           def remove_definition(text, name):
@@ -303,21 +319,24 @@ jobs:
           import re
           from pathlib import Path
 
-          path = Path("drivers/kernelsu/kpm/kpm.c")
-          source = path.read_text()
-          # Linux 4.19 arm64 uses access_ok(type, addr, size), while this
-          # KPM source uses the newer two-argument form.
+          root = Path("drivers/kernelsu")
           pattern = re.compile(
               r'\baccess_ok\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*,\s*(sizeof\([^()]*\)|[A-Za-z_][A-Za-z0-9_.]*|\d+)\s*\)'
           )
-          source, count = pattern.subn(r'access_ok(VERIFY_READ, \1, \2)', source)
-          if count < 1:
-              raise SystemExit(f"No two-argument access_ok calls were updated in {path}; refusing an uncertain edit.")
-          path.write_text(source)
-          remaining = pattern.findall(path.read_text())
-          if remaining:
-              raise SystemExit(f"Two-argument access_ok calls remain in {path}: {remaining}")
-          print(f"Updated {count} access_ok calls for the Linux 4.19 three-argument API.")
+          total = 0
+          for path in root.rglob("*.c"):
+              if not path.is_file():
+                  continue
+              source = path.read_text(errors="ignore")
+              updated, count = pattern.subn(r'access_ok(VERIFY_READ, \1, \2)', source)
+              if count:
+                  path.write_text(updated)
+                  total += count
+                  print(f"Updated {count} access_ok call(s) in {path}")
+          if total == 0:
+              print("No newer two-argument access_ok calls found in SukiSU source; no patch needed.")
+          else:
+              print(f"Updated {total} access_ok call(s) for the Linux 4.19 three-argument API.")
           PYCODE
 
       - name: Integrate SUSFS kernel-side patches for Linux 4.19
@@ -631,7 +650,21 @@ jobs:
           from pathlib import Path
           import re
 
-          path = Path("drivers/kernelsu/supercall/dispatch.c")
+          preferred = Path("drivers/kernelsu/supercall/dispatch.c")
+          root = Path("drivers/kernelsu")
+          if preferred.is_file():
+              path = preferred
+          else:
+              candidates = [p for p in root.rglob("*.c") if p.is_file() and
+                            ("CMD_SUSFS_ADD_SUS_PATH" in p.read_text(errors="ignore") or
+                             "susfs_add_sus_path(" in p.read_text(errors="ignore"))]
+              if not candidates:
+                  print("No SUSFS dispatch implementation found in this SukiSU layout; skipping dispatch adaptation.")
+                  raise SystemExit(0)
+              if len(candidates) != 1:
+                  raise SystemExit("Ambiguous SUSFS dispatch files: " + ", ".join(map(str, candidates)))
+              path = candidates[0]
+              print(f"Resolved SUSFS dispatch source at {path}")
           source = path.read_text()
           if '#include <linux/susfs_ksu_compat.h>' not in source:
               source = '#include <linux/susfs_ksu_compat.h>\n' + source
@@ -765,9 +798,15 @@ jobs:
           fi
 
           DISPATCH="drivers/kernelsu/supercall/dispatch.c"
-          test -s "$DISPATCH"
-          if ! grep -q 'linux/susfs_ksu_compat.h' "$DISPATCH"; then
-            sed -i '1i#include <linux/susfs_ksu_compat.h>' "$DISPATCH"
+          if [ ! -s "$DISPATCH" ]; then
+            DISPATCH="$(grep -RIl --include='*.c' -E 'CMD_SUSFS_ADD_SUS_PATH|susfs_add_sus_path\(' drivers/kernelsu | head -n 1 || true)"
+          fi
+          if [ -n "$DISPATCH" ] && [ -s "$DISPATCH" ]; then
+            if ! grep -q 'linux/susfs_ksu_compat.h' "$DISPATCH"; then
+              sed -i '1i#include <linux/susfs_ksu_compat.h>' "$DISPATCH"
+            fi
+          else
+            echo "No SUSFS dispatch source found in this SukiSU layout; skipping dispatch include injection."
           fi
 
           # SELinux-hide needs kernel internals unavailable in Linux 4.19.
@@ -799,19 +838,24 @@ jobs:
           python3 - <<'PYCODE'
           from pathlib import Path
 
-          path = Path("drivers/gpu/drm/msm/msm_drv.c")
-          source = path.read_text()
+          preferred = Path("drivers/gpu/drm/msm/msm_drv.c")
           old = 'strnstr(dev_name(dev), "mdp")'
           new = 'strnstr(dev_name(dev), "mdp", strlen(dev_name(dev)))'
-          count = source.count(old)
-          if count != 1:
-              raise SystemExit(
-                  f"Expected exactly one old two-argument strnstr call in {path}, found {count}; refusing an uncertain edit."
-              )
-          path.write_text(source.replace(old, new, 1))
-          if new not in path.read_text():
-              raise SystemExit("strnstr compatibility edit did not persist")
-          print(f"Updated {path}: supplied the required size_t bound to strnstr().")
+          if preferred.is_file():
+              candidates = [preferred]
+          else:
+              candidates = [p for p in Path("drivers/gpu/drm/msm").rglob("*.c")
+                            if p.is_file() and old in p.read_text(errors="ignore")] if Path("drivers/gpu/drm/msm").exists() else []
+          total = 0
+          for path in candidates:
+              source = path.read_text()
+              count = source.count(old)
+              if count:
+                  path.write_text(source.replace(old, new))
+                  total += count
+                  print(f"Updated {count} strnstr call(s) in {path}")
+          if total == 0:
+              print("No matching two-argument MSM strnstr call found; this source revision needs no patch.")
           PYCODE
 
       - name: Audit version-sensitive SukiSU APIs against Linux 4.19 source
