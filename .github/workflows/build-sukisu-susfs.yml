@@ -79,34 +79,53 @@ jobs:
           grep -q 'kernelsu' drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig
 
-      - name: Backport seccomp syscall-count definition for Linux 4.19
+      - name: Backport seccomp syscall-count definition for Linux 4.19 when needed
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
           python3 - <<'PYCODE'
           from pathlib import Path
+          import re
 
-          path = Path("drivers/kernelsu/infra/seccomp_cache.c")
-          source = path.read_text()
-          include = "#include <linux/seccomp.h>"
-          compatibility = "#include <asm/unistd.h>\n\n#ifndef SECCOMP_ARCH_NATIVE_NR\n#define SECCOMP_ARCH_NATIVE_NR NR_syscalls\n#endif /* SECCOMP_ARCH_NATIVE_NR */"
+          root = Path("drivers/kernelsu")
+          if not root.exists():
+              raise SystemExit(f"SukiSU integration directory not found: {root}")
 
-          if "#ifndef SECCOMP_ARCH_NATIVE_NR" in source:
-              print("SECCOMP_ARCH_NATIVE_NR fallback already exists.")
+          # Do not assume a particular SukiSU directory layout. Patch only
+          # compiled-tree source files that actually reference this macro.
+          candidates = [p for p in root.rglob("*.c") if p.is_file()]
+          targets = []
+          for path in candidates:
+              source = path.read_text(errors="replace")
+              if re.search(r"\bSECCOMP_ARCH_NATIVE_NR\b", source) and not re.search(
+                  r"^\s*#\s*define\s+SECCOMP_ARCH_NATIVE_NR\b", source, re.M
+              ):
+                  targets.append((path, source))
+
+          if not targets:
+              print("No unresolved SECCOMP_ARCH_NATIVE_NR use in drivers/kernelsu; no patch needed for this SukiSU revision.")
           else:
-              if include not in source:
-                  raise SystemExit(f"Expected {include} in {path}; refusing an uncertain edit.")
-              source = source.replace(include, include + "\n" + compatibility, 1)
-              path.write_text(source)
-
-          source = path.read_text()
-          if "#include <asm/unistd.h>" not in source:
-              raise SystemExit(f"asm/unistd.h include missing from {path}.")
-          if "#define SECCOMP_ARCH_NATIVE_NR NR_syscalls" not in source:
-              raise SystemExit(f"SECCOMP_ARCH_NATIVE_NR fallback missing from {path}.")
-          if source.count("#ifndef SECCOMP_ARCH_NATIVE_NR") != 1:
-              raise SystemExit(f"Unexpected duplicate fallback guards in {path}.")
-          print("Added Linux 4.19 fallback using the architecture's NR_syscalls value.")
+              for path, source in targets:
+                  include = "#include <linux/seccomp.h>"
+                  compatibility = (
+                      "#include <asm/unistd.h>\n\n"
+                      "#ifndef SECCOMP_ARCH_NATIVE_NR\n"
+                      "#define SECCOMP_ARCH_NATIVE_NR NR_syscalls\n"
+                      "#endif /* SECCOMP_ARCH_NATIVE_NR */"
+                  )
+                  if "#include <asm/unistd.h>" not in source:
+                      if include not in source:
+                          raise SystemExit(
+                              f"{path} references SECCOMP_ARCH_NATIVE_NR but has no expected seccomp include; "
+                              "refusing to inject a potentially incorrect compatibility definition."
+                          )
+                      source = source.replace(include, include + "\n" + compatibility, 1)
+                      path.write_text(source)
+                      print(f"Added Linux 4.19 NR_syscalls fallback in {path}")
+                  elif "#define SECCOMP_ARCH_NATIVE_NR NR_syscalls" not in source:
+                      raise SystemExit(f"{path} already includes asm/unistd.h but needs manual review for the macro definition.")
+                  else:
+                      print(f"Compatibility fallback already present in {path}")
           PYCODE
 
       - name: Guard module namespace import for Linux 4.19
