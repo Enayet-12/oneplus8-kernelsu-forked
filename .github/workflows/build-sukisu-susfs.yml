@@ -1199,6 +1199,115 @@ jobs:
               print("Oplus Synaptics response completion already has internal linkage")
           PYCODE
 
+      - name: Resolve final-link SUSFS and DRM dependencies
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          # SUSFS 1.5.5 names the implementation susfs_try_umount(uid); the
+          # namespace patch calls the newer susfs_try_umount_all(uid) name.
+          susfs = Path("fs/susfs.c")
+          source = susfs.read_text()
+          wrapper = "\nvoid susfs_try_umount_all(uid_t uid)\n{\n    susfs_try_umount(uid);\n}\n"
+          marker = "#endif // #ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT\n/* spoof_uname */"
+          if "void susfs_try_umount_all(uid_t uid)" not in source:
+              if marker not in source:
+                  raise SystemExit("Cannot locate SUSFS try-umount section to adapt susfs_try_umount_all")
+              source = source.replace(marker, wrapper + marker, 1)
+              susfs.write_text(source)
+              print("Mapped namespace try-umount entry point to SUSFS 1.5.5 implementation")
+
+          # SukiSU builtin's kernel_umount.c provides the real path_umount helper
+          # internally, but SUSFS 1.5.5 expects it exported as ksu_try_umount.
+          umount = Path("drivers/kernelsu/feature/kernel_umount.c")
+          if not umount.is_file():
+              candidates = list(Path("drivers/kernelsu").rglob("kernel_umount.c"))
+              if len(candidates) != 1:
+                  raise SystemExit("Could not uniquely locate SukiSU kernel_umount.c")
+              umount = candidates[0]
+          source = umount.read_text()
+          helper = "\n/* SUSFS 1.5.5 calls this helper for its registered try-umount paths. */\nvoid ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid)\n{\n    const struct cred *saved;\n    (void)check_mnt; /* SUSFS 1.5.5 passes false for these calls. */\n    (void)uid;       /* Target uid is policy context, not caller credentials. */\n    if (!ksu_cred || !mnt)\n        return;\n    saved = override_creds(ksu_cred);\n    try_umount(mnt, flags);\n    revert_creds(saved);\n}\n"
+          if "void ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid)" not in source:
+              marker = "\nstruct umount_tw {"
+              pos = source.find(marker)
+              start = source.find("static void try_umount(const char *mnt, int flags)")
+              if start < 0 or pos < 0 or pos < start:
+                  raise SystemExit(f"Cannot safely locate try_umount insertion point in {umount}")
+              source = source[:pos] + helper + source[pos:]
+              umount.write_text(source)
+              print(f"Exported SUSFS-compatible umount adapter using SukiSU's real path_umount implementation in {umount}")
+
+          # SUSFS 1.5.5 does not provide the newer susfs_extra_works work item.
+          # Remove only the scheduling dependency; do not fabricate an empty work.
+          lsm = Path("drivers/kernelsu/hook/lsm_hook.c")
+          if not lsm.is_file():
+              candidates = list(Path("drivers/kernelsu").rglob("lsm_hook.c"))
+              if len(candidates) != 1:
+                  raise SystemExit("Could not uniquely locate SukiSU lsm_hook.c")
+              lsm = candidates[0]
+          source = lsm.read_text()
+          source = re.sub(r"(?m)^\s*extern struct work_struct susfs_extra_works;\s*\n", "", source)
+          source, helper_count = re.subn(r"(?s)static inline void ksu_handle_extra_susfs_work\(void\)\s*\{.*?\n\}", "", source, count=1)
+          source, call_count = re.subn(r"(?m)^\s*ksu_handle_extra_susfs_work\(\);\s*\n", "", source)
+          lsm.write_text(source)
+          print(f"Removed unavailable SUSFS extra-work scheduling helper ({helper_count} helper, {call_count} calls); SUSFS 1.5.5 has no implementation for it")
+
+          # The generic DRM MSM composite object duplicates several techpack
+          # implementations on Kona. Keep it excluded, but provide the real
+          # blocking notifier chain required by the vendor display stack.
+          drm_mk = Path("drivers/gpu/drm/msm/Makefile")
+          drm_source = Path("drivers/gpu/drm/msm/msm_drm_notifier_compat.c")
+          notifier_code = "\n".join([
+              "#include <linux/export.h>",
+              "#include <linux/notifier.h>",
+              "",
+              "static BLOCKING_NOTIFIER_HEAD(msm_drm_notifier_list);",
+              "",
+              "int msm_drm_register_client(struct notifier_block *nb)",
+              "{",
+              "    return blocking_notifier_chain_register(&msm_drm_notifier_list, nb);",
+              "}",
+              "EXPORT_SYMBOL(msm_drm_register_client);",
+              "",
+              "int msm_drm_unregister_client(struct notifier_block *nb)",
+              "{",
+              "    return blocking_notifier_chain_unregister(&msm_drm_notifier_list, nb);",
+              "}",
+              "EXPORT_SYMBOL(msm_drm_unregister_client);",
+              "",
+              "int msm_drm_notifier_call_chain(unsigned long val, void *v)",
+              "{",
+              "    return blocking_notifier_call_chain(&msm_drm_notifier_list, val, v);",
+              "}",
+              "EXPORT_SYMBOL(msm_drm_notifier_call_chain);",
+              ""
+          ])
+          if not drm_source.exists():
+              drm_source.write_text(notifier_code)
+              print("Added a real blocking notifier-chain implementation for the Kona vendor display stack")
+          elif "msm_drm_notifier_call_chain" not in drm_source.read_text():
+              raise SystemExit(f"Existing {drm_source} is not the expected notifier implementation")
+
+          mk = drm_mk.read_text()
+          build_rule = "ifeq ($(CONFIG_ARCH_KONA),y)\nobj-y += msm_drm_notifier_compat.o\nendif"
+          if "obj-y += msm_drm_notifier_compat.o" not in mk:
+              mk += "\n\n# Vendor techpack/display notifier API on Kona (generic msm.o excluded).\n" + build_rule + "\n"
+              drm_mk.write_text(mk)
+              print("Added notifier compatibility object while keeping duplicate generic msm.o excluded")
+
+          # Fail early if any targeted references remain unadapted.
+          if "susfs_extra_works" in lsm.read_text():
+              raise SystemExit("susfs_extra_works reference remains in lsm_hook.c")
+          if "void susfs_try_umount_all(uid_t uid)" not in susfs.read_text():
+              raise SystemExit("susfs_try_umount_all adapter was not written")
+          if "void ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid)" not in umount.read_text():
+              raise SystemExit("ksu_try_umount adapter was not written")
+          print("Final-link compatibility adapters installed")
+          PYCODE
+
       - name: Build kernel (save full compiler log)
         run: |
           set -euxo pipefail
