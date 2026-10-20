@@ -103,15 +103,14 @@ jobs:
           source = path.read_text()
 
           def remove_definition(text, name):
-              # Find a real definition by requiring the balanced parameter list
-              # to be followed by an opening brace. This avoids matching calls.
+              """Remove one function definition without consuming surrounding #if lines."""
               search_from = 0
               while True:
                   match = re.search(r"\b" + re.escape(name) + r"\s*\(", text[search_from:])
                   if not match:
                       return text, False
-                  start = search_from + match.start()
-                  open_paren = text.find("(", start)
+                  name_start = search_from + match.start()
+                  open_paren = text.find("(", name_start)
                   depth = 0
                   close_paren = None
                   for i in range(open_paren, len(text)):
@@ -124,61 +123,102 @@ jobs:
                               break
                   if close_paren is None:
                       raise SystemExit(f"Unbalanced parameter list while locating {name} in {path}.")
+
                   after = close_paren + 1
                   while after < len(text) and text[after].isspace():
                       after += 1
                   if after >= len(text) or text[after] != "{":
                       search_from = close_paren + 1
                       continue
-                  # The return type can be on the line before the function name.
-                  # Start after the previous declaration/body delimiter so removal
-                  # does not leave a dangling return type (the previous bug).
-                  delimiters = [text.rfind(token, 0, start) for token in (";", "}", "{")]
-                  declaration_start = max(delimiters) + 1
-                  # Begin on the line after the delimiter. Using rfind() here
-                  # would select the previous function's closing-brace line and
-                  # accidentally delete that function as well.
-                  next_newline = text.find("\n", declaration_start)
-                  line_start = next_newline + 1 if next_newline >= 0 else declaration_start
+
+                  # Find the declaration's start by walking backwards through the
+                  # adjacent declaration lines. Stop at blank lines and preprocessor
+                  # directives so a preceding #if/#ifdef is never removed.
+                  line_start = text.rfind("\n", 0, name_start) + 1
+                  declaration_start = line_start
+                  cursor = line_start
+                  while cursor > 0:
+                      prev_end = cursor - 1
+                      prev_start = text.rfind("\n", 0, prev_end) + 1
+                      prev_line = text[prev_start:prev_end].rstrip("\r")
+                      stripped = prev_line.strip()
+                      if not stripped or stripped.startswith("#") or any(ch in stripped for ch in "{};"):
+                          break
+                      declaration_start = prev_start
+                      cursor = prev_start
+
+                  # A return type is commonly on the line immediately above the
+                  # function name (e.g. 'static int\nfunction(...)'). Include it.
+                  # If no prior declaration line was found, the name line is the start.
                   brace_depth = 0
-                  end = None
+                  body_end = None
                   for i in range(after, len(text)):
                       if text[i] == "{":
                           brace_depth += 1
                       elif text[i] == "}":
                           brace_depth -= 1
                           if brace_depth == 0:
-                              end = i + 1
+                              body_end = i + 1
                               break
-                  if end is None:
+                  if body_end is None:
                       raise SystemExit(f"Unbalanced function body while locating {name} in {path}.")
-                  # Remove the complete declaration and body.
-                  if end < len(text) and text[end] == "\n":
-                      end += 1
-                  return text[:line_start] + text[end:], True
+                  if body_end < len(text) and text[body_end] == "\n":
+                      body_end += 1
+                  return text[:declaration_start] + text[body_end:], True
 
-          # These callbacks and their file_operations members are absent from
-          # the target Linux 4.19 tree. Remove their wrappers instead of relying
-          # on fragile version guards that can leave field accesses unguarded.
           for function in ("ksu_wrapper_iopoll", "ksu_wrapper_remap_file_range"):
               source, removed = remove_definition(source, function)
               if not removed:
                   print(f"No definition of {function} found; checking for stale references.")
 
-          # Remove callback assignments and any remaining references to these
-          # unavailable members/constants. Other file-wrapper callbacks remain intact.
+          # Remove only C-code lines that reference the unavailable callbacks or
+          # their associated constant. Never remove preprocessor directives.
           kept_lines = []
           for line in source.splitlines(keepends=True):
-              if re.search(r"\b(iopoll|remap_file_range|REMAP_FILE_DEDUP)\b", line):
+              if line.lstrip().startswith("#"):
+                  kept_lines.append(line)
+              elif re.search(r"\b(?:iopoll|remap_file_range|REMAP_FILE_DEDUP)\b", line):
                   continue
-              kept_lines.append(line)
+              else:
+                  kept_lines.append(line)
           source = "".join(kept_lines)
 
-          leftovers = re.findall(r"\b(?:iopoll|remap_file_range|REMAP_FILE_DEDUP)\b", source)
+          # Validate conditional structure, but never 'repair' it by deleting
+          # #else/#endif. If the source is malformed, fail with a useful error.
+          pp_stack = []
+          for number, line in enumerate(source.splitlines(), 1):
+              directive = re.match(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b", line)
+              if not directive:
+                  continue
+              kind = directive.group(1)
+              if kind in ("if", "ifdef", "ifndef"):
+                  pp_stack.append((kind, number, False))
+              elif kind in ("elif", "else"):
+                  if not pp_stack:
+                      raise SystemExit(f"Orphan #{kind} at {path}:{number}; refusing to delete directives automatically.")
+                  prior_kind, prior_line, had_else = pp_stack[-1]
+                  if had_else:
+                      raise SystemExit(f"#{kind} after #else for conditional opened at {path}:{prior_line}.")
+                  if kind == "else":
+                      pp_stack[-1] = (prior_kind, prior_line, True)
+              elif kind == "endif":
+                  if not pp_stack:
+                      raise SystemExit(f"Orphan #endif at {path}:{number}; refusing to delete directives automatically.")
+                  pp_stack.pop()
+          if pp_stack:
+              raise SystemExit(f"Unclosed preprocessor conditional(s) in {path}: {pp_stack}")
+
+          leftovers = [
+              f"{number}: {line.strip()}"
+              for number, line in enumerate(source.splitlines(), 1)
+              if not line.lstrip().startswith("#")
+              and re.search(r"\b(?:iopoll|remap_file_range|REMAP_FILE_DEDUP)\b", line)
+          ]
           if leftovers:
               raise SystemExit(f"Unsupported callback references remain in {path}: {leftovers}")
+
           path.write_text(source)
-          print("Removed all iopoll/remap_file_range references from file_wrapper.c for Linux 4.19.")
+          print("Removed incompatible callback code; preserved and validated all preprocessor directives.")
           PYCODE
 
       - name: Fix KPM access_ok API for Linux 4.19
