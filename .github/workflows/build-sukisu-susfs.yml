@@ -955,8 +955,8 @@ jobs:
           # Ensure the unresolved identifiers from the reported build are either
           # genuinely handled or reported as an explicit integration limitation.
           feature_source = feature_c.read_text(errors="ignore") if feature_c.is_file() else ""
-          if not enum_declared and "KSU_FEATURE_SELINUX_HIDE" in feature_source:
-              raise SystemExit("KSU_FEATURE_SELINUX_HIDE remains in feature.c without an enum definition")
+          if re.search(r"(?m)^[ \t]*\[KSU_FEATURE_SELINUX_HIDE\]", feature_source):
+              raise SystemExit("KSU_FEATURE_SELINUX_HIDE table entry remains in feature.c")
           print("Compatibility pass complete. Note: SUSFS v1.5.5 cannot provide the newer per-process task-state or SELinux-hide features without a matching implementation.")
           PYCODE
           echo "::warning::SUSFS v1.5.5 lacks SukiSU's newer per-process task-state APIs; those hooks are conditionally disabled rather than replaced with fake stubs."
