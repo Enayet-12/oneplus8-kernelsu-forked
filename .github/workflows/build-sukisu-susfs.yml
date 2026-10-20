@@ -130,7 +130,16 @@ jobs:
                   if after >= len(text) or text[after] != "{":
                       search_from = close_paren + 1
                       continue
-                  line_start = text.rfind("\n", 0, start) + 1
+                  # The return type can be on the line before the function name.
+                  # Start after the previous declaration/body delimiter so removal
+                  # does not leave a dangling return type (the previous bug).
+                  delimiters = [text.rfind(token, 0, start) for token in (";", "}", "{")]
+                  declaration_start = max(delimiters) + 1
+                  # Begin on the line after the delimiter. Using rfind() here
+                  # would select the previous function's closing-brace line and
+                  # accidentally delete that function as well.
+                  next_newline = text.find("\n", declaration_start)
+                  line_start = next_newline + 1 if next_newline >= 0 else declaration_start
                   brace_depth = 0
                   end = None
                   for i in range(after, len(text)):
@@ -143,7 +152,7 @@ jobs:
                               break
                   if end is None:
                       raise SystemExit(f"Unbalanced function body while locating {name} in {path}.")
-                  # Remove the full definition, not just the line containing its call.
+                  # Remove the complete declaration and body.
                   if end < len(text) and text[end] == "\n":
                       end += 1
                   return text[:line_start] + text[end:], True
